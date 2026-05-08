@@ -56,7 +56,6 @@ SECTOR_SIC_CODES: Dict[str, frozenset] = {
     }),
 }
 
-# Flat sorted list of all tracked SIC codes for the API query
 ALL_TARGET_SIC_CODES: List[str] = sorted({
     code for codes in SECTOR_SIC_CODES.values() for code in codes
 })
@@ -82,9 +81,9 @@ MAX_WORKERS = 10
 RATE_WINDOW_SECONDS = 300
 SAFE_REQUESTS_PER_WINDOW = 540
 
-_AUTH_HEADER_CACHE: Dict[str, Dict[str, str]] = {}
-_AUTH_CACHE_LOCK = threading.Lock()
-_rate_buckets: Dict[str, deque] = {}
+_auth_header_cache: Optional[Dict[str, str]] = None
+_auth_cache_lock = threading.Lock()
+_rate_bucket: deque = deque()
 _rate_lock = threading.Lock()
 _write_lock = threading.Lock()
 
@@ -92,15 +91,16 @@ _write_lock = threading.Lock()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_auth_header(api_key: str) -> Dict[str, str]:
-    """Cache Base64-encoded auth headers — encoding runs once per key, ever."""
-    with _AUTH_CACHE_LOCK:
-        if api_key not in _AUTH_HEADER_CACHE:
+    """Cache the auth header — Base64 encoding runs once, ever."""
+    global _auth_header_cache
+    with _auth_cache_lock:
+        if _auth_header_cache is None:
             token = base64.b64encode(f"{api_key}:".encode()).decode()
-            _AUTH_HEADER_CACHE[api_key] = {
+            _auth_header_cache = {
                 "Authorization": f"Basic {token}",
                 "User-Agent": APP_USER_AGENT,
             }
-        return _AUTH_HEADER_CACHE[api_key]
+        return _auth_header_cache
 
 
 def today_uk_str() -> str:
@@ -111,21 +111,13 @@ def now_uk_str() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_api_keys() -> List[str]:
-    keys: List[str] = []
-    list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
-    if list_style_keys:
-        keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
-    for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
-        value = st.secrets.get(key_name, "")
-        if value:
-            keys.append(str(value).strip())
-    seen: set = set()
-    return [k for k in keys if k and not (k in seen or seen.add(k))]
+def get_api_key() -> str:
+    """Load the single API key from Streamlit secrets."""
+    key = st.secrets.get("CH_API_KEY", "")
+    return str(key).strip()
 
 
 def classify_sector(sic_codes: List[str]) -> Optional[str]:
-    """Return the first matching sector for the given SIC codes, in SECTOR_SIC_CODES order."""
     if not sic_codes:
         return None
     codes = set(sic_codes)
@@ -203,41 +195,32 @@ def get_db_connection() -> sqlite3.Connection:
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 
-def throttle_for_key(api_key: str) -> None:
-    """Sliding-window rate limiter using collections.deque for O(1) operations."""
+def throttle() -> None:
+    """Sliding-window rate limiter for a single API key using deque (O(1))."""
     while True:
         now_ts = time.monotonic()
         with _rate_lock:
-            bucket = _rate_buckets.setdefault(api_key, deque())
             cutoff = now_ts - RATE_WINDOW_SECONDS
-            while bucket and bucket[0] < cutoff:
-                bucket.popleft()
-            if len(bucket) < SAFE_REQUESTS_PER_WINDOW:
-                bucket.append(now_ts)
+            while _rate_bucket and _rate_bucket[0] < cutoff:
+                _rate_bucket.popleft()
+            if len(_rate_bucket) < SAFE_REQUESTS_PER_WINDOW:
+                _rate_bucket.append(now_ts)
                 return
-            sleep_for = max(0.25, RATE_WINDOW_SECONDS - (now_ts - bucket[0]))
+            sleep_for = max(0.25, RATE_WINDOW_SECONDS - (now_ts - _rate_bucket[0]))
         time.sleep(min(sleep_for, 2.0))
 
 
-def fetch_with_rotation(
+def api_get(
     session: requests.Session,
     url: str,
     params: Optional[Dict],
-    api_keys: List[str],
+    api_key: str,
     timeout: int = REQUEST_TIMEOUT,
 ) -> requests.Response:
-    last_response = None
-    for api_key in api_keys:
-        throttle_for_key(api_key)
-        response = session.get(url, headers=_get_auth_header(api_key), params=params, timeout=timeout)
-        if response.status_code in (401, 429):
-            last_response = response
-            continue
-        response.raise_for_status()
-        return response
-    if last_response is not None:
-        last_response.raise_for_status()
-    raise RuntimeError("No valid Companies House API keys were available.")
+    throttle()
+    response = session.get(url, headers=_get_auth_header(api_key), params=params, timeout=timeout)
+    response.raise_for_status()
+    return response
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -255,7 +238,7 @@ def get_cached_decisions_map(company_numbers: List[str]) -> Dict[str, bool]:
 
 
 def batch_upsert_decisions(results: List[Tuple[str, bool, List[str]]]) -> None:
-    """Write all officer-check results in ONE transaction — far faster than N individual commits."""
+    """Write all officer-check results in ONE transaction."""
     if not results:
         return
     conn = get_db_connection()
@@ -282,7 +265,7 @@ def batch_upsert_decisions(results: List[Tuple[str, bool, List[str]]]) -> None:
 def get_active_director_countries(
     session: requests.Session,
     company_number: str,
-    api_keys: List[str],
+    api_key: str,
 ) -> List[str]:
     url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
     params = {
@@ -290,7 +273,7 @@ def get_active_director_countries(
         "register_type": "directors",
         "items_per_page": "100",
     }
-    response = fetch_with_rotation(session, url, params, api_keys)
+    response = api_get(session, url, params, api_key)
     items = response.json().get("items") or []
     return [
         c for officer in items
@@ -300,12 +283,12 @@ def get_active_director_countries(
 
 def check_company_exclusion(
     company_number: str,
-    api_keys: List[str],
+    api_key: str,
 ) -> Tuple[str, bool, List[str]]:
-    """Returns (company_number, excluded, countries). Does NOT write to DB — caller batches."""
+    """Returns (company_number, excluded, countries). Caller handles DB write."""
     session = get_http_session()
     try:
-        countries = get_active_director_countries(session, company_number, api_keys)
+        countries = get_active_director_countries(session, company_number, api_key)
         excluded = any(c in EXCLUDED_DIRECTOR_COUNTRIES for c in countries)
     except requests.RequestException:
         countries = []
@@ -315,7 +298,7 @@ def check_company_exclusion(
 
 # ── Core data pipeline ────────────────────────────────────────────────────────
 
-def fetch_candidate_companies(api_keys: List[str], run_date: str) -> pd.DataFrame:
+def fetch_candidate_companies(api_key: str, run_date: str) -> pd.DataFrame:
     session = get_http_session()
     url = "https://api.company-information.service.gov.uk/advanced-search/companies"
     rows: List[dict] = []
@@ -329,7 +312,7 @@ def fetch_candidate_companies(api_keys: List[str], run_date: str) -> pd.DataFram
             "size": str(ADVANCED_SEARCH_PAGE_SIZE),
             "start_index": str(start_index),
         }
-        response = fetch_with_rotation(session, url, params, api_keys)
+        response = api_get(session, url, params, api_key)
         payload = response.json()
         items = payload.get("items") or []
 
@@ -358,7 +341,7 @@ def fetch_candidate_companies(api_keys: List[str], run_date: str) -> pd.DataFram
 
 def enrich_exclusions(
     candidate_df: pd.DataFrame,
-    api_keys: List[str],
+    api_key: str,
 ) -> Tuple[pd.DataFrame, int, int]:
     if candidate_df.empty:
         return candidate_df.copy(), 0, 0
@@ -374,7 +357,7 @@ def enrich_exclusions(
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(check_company_exclusion, cn, api_keys): cn
+                executor.submit(check_company_exclusion, cn, api_key): cn
                 for cn in uncached_numbers
             }
             for future in as_completed(futures):
@@ -449,11 +432,11 @@ def get_cache_size() -> int:
 
 
 def build_current_day_dataset(
-    api_keys: List[str],
+    api_key: str,
     run_date: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, int, int]:
-    candidate_df = fetch_candidate_companies(api_keys, run_date)
-    filtered_df, checked_via_api, cache_hits = enrich_exclusions(candidate_df, api_keys)
+    candidate_df = fetch_candidate_companies(api_key, run_date)
+    filtered_df, checked_via_api, cache_hits = enrich_exclusions(candidate_df, api_key)
 
     existing_df = load_snapshot(run_date)
     if existing_df.empty:
@@ -522,16 +505,15 @@ def main() -> None:
         "are resident in Pakistan, Turkey, China, or Nigeria."
     )
 
-    api_keys = get_api_keys()
-    if not api_keys:
-        st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets.")
+    api_key = get_api_key()
+    if not api_key:
+        st.error("Add CH_API_KEY to your Streamlit secrets before running the app.")
         st.stop()
 
     run_date = today_uk_str()
 
     st.sidebar.header("Controls")
     st.sidebar.write(f"Run date: {run_date}")
-    st.sidebar.write(f"API keys loaded: {len(api_keys)}")
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Sectors tracked**")
     for sector, codes in SECTOR_SIC_CODES.items():
@@ -541,7 +523,7 @@ def main() -> None:
 
     if refresh or "latest_df" not in st.session_state:
         started = time.perf_counter()
-        current_df, new_df, checked_via_api, cache_hits = build_current_day_dataset(api_keys, run_date)
+        current_df, new_df, checked_via_api, cache_hits = build_current_day_dataset(api_key, run_date)
         elapsed = time.perf_counter() - started
 
         st.session_state.update({
@@ -569,7 +551,6 @@ def main() -> None:
     current_df = st.session_state.get("latest_df", pd.DataFrame())
     new_df = st.session_state.get("new_df", pd.DataFrame())
 
-    # ── Top metrics ───────────────────────────────────────────────────────────
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total pulled today", int(len(current_df)))
     c2.metric("New on latest refresh", int(len(new_df)))
@@ -580,7 +561,6 @@ def main() -> None:
     st.write(f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
     st.write(f"Persistent cached company decisions: {int(st.session_state.get('cache_size', 0))}")
 
-    # ── Sector breakdown bar chart ────────────────────────────────────────────
     if not current_df.empty and "sector" in current_df.columns:
         st.markdown("---")
         st.subheader("Today's breakdown by sector")
@@ -595,7 +575,6 @@ def main() -> None:
 
     st.markdown("---")
 
-    # ── Per-sector tabs ───────────────────────────────────────────────────────
     sector_names = list(SECTOR_SIC_CODES.keys())
     tabs = st.tabs(["All"] + sector_names)
 
@@ -608,7 +587,6 @@ def main() -> None:
             sector_df = current_df[current_df["sector"] == sector] if not current_df.empty else pd.DataFrame()
             render_table(sector_df, f"{sector} — incorporated today")
 
-    # ── Download ──────────────────────────────────────────────────────────────
     if not current_df.empty:
         st.download_button(
             label="Download today's results as CSV",
@@ -619,19 +597,14 @@ def main() -> None:
         )
 
     with st.expander("Suggested .streamlit/secrets.toml"):
-        st.code(
-            'COMPANIES_HOUSE_API_KEYS = [\n  "your-first-key",\n  "your-second-key",\n  "your-third-key"\n]',
-            language="toml",
-        )
+        st.code('CH_API_KEY = "your-companies-house-api-key"', language="toml")
 
     with st.expander("Architecture notes"):
         st.markdown("""
 - Tracks five sectors: **Wholesale** (50 codes), **Manufacturing** (80 codes), **Construction** (18 codes), **Restaurants & Takeaways** (3 codes), **Retail / Shops** (27 codes).
-- `SECTOR_SIC_CODES` dict drives everything — add or remove sectors/codes in one place.
-- `classify_sector()` iterates sectors in definition order; first match wins for any SIC overlap.
-- All officer-check results batched into a **single SQLite transaction** per refresh.
-- Auth headers pre-computed and cached — Base64 encoding runs once per key, ever.
-- `deque`-based sliding-window rate limiter: O(1) vs the original O(n) list approach.
+- Single API key — rate limiter uses one shared `deque` bucket (O(1) operations).
+- Auth header cached for the process lifetime — Base64 encoding runs once, ever.
+- All officer-check results written in a **single SQLite transaction** per refresh.
 - `time.monotonic()` for rate-limiting — immune to clock changes and NTP drift.
 - Thread pool sized to `MAX_WORKERS=10` with matching HTTP connection pool.
 - `save_daily_state` uses `conn.commit()` with `conn.rollback()` on failure.
